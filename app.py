@@ -4,10 +4,15 @@ from pathlib import Path
 
 import joblib
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_curve, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 
-from src.churn_pipeline import MODEL_INPUT_FEATURES, assign_risk_band
+from src.churn_pipeline import MODEL_INPUT_FEATURES, assign_risk_band, build_preprocessor, get_feature_names, split_features_target
 
 
 ROOT = Path(__file__).resolve().parent
@@ -16,15 +21,70 @@ DATA_PATH = ROOT / "data" / "churn_dataset.csv"
 DEFAULT_DATA = Path(r"C:\Users\Admin\Downloads\churn dataset.csv")
 
 
-@st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
-
-
 @st.cache_data
 def load_data():
     path = DATA_PATH if DATA_PATH.exists() else DEFAULT_DATA
     return pd.read_csv(path)
+
+
+def choose_threshold(y_true: pd.Series, probabilities: np.ndarray) -> float:
+    precision, recall, thresholds = precision_recall_curve(y_true, probabilities)
+    thresholds = np.r_[thresholds, 1.0]
+    f1 = np.divide(2 * precision * recall, precision + recall, out=np.zeros_like(precision), where=(precision + recall) > 0)
+    feasible = np.where(precision >= 0.60)[0]
+    if len(feasible):
+        return float(thresholds[feasible[np.argmax(f1[feasible])]])
+    return float(thresholds[np.argmax(f1)])
+
+
+def train_cloud_model(df: pd.DataFrame) -> dict:
+    X, y = split_features_target(df)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, stratify=y, random_state=42)
+    pipeline = Pipeline(
+        [
+            ("preprocessor", build_preprocessor()),
+            ("model", GradientBoostingClassifier(random_state=42)),
+        ]
+    )
+    pipeline.fit(X_train, y_train)
+    probabilities = pipeline.predict_proba(X_test)[:, 1]
+    threshold = choose_threshold(y_test, probabilities)
+    predictions = (probabilities >= threshold).astype(int)
+
+    preprocessor = pipeline.named_steps["preprocessor"]
+    model = pipeline.named_steps["model"]
+    importance = pd.DataFrame(
+        {
+            "feature": get_feature_names(preprocessor),
+            "importance": model.feature_importances_,
+        }
+    ).sort_values("importance", ascending=False)
+
+    return {
+        "pipeline": pipeline,
+        "threshold": threshold,
+        "model_name": "Gradient Boosting",
+        "feature_importance": importance.to_dict(orient="records"),
+        "metrics": {
+            "model": "Gradient Boosting",
+            "accuracy": accuracy_score(y_test, predictions),
+            "precision": precision_score(y_test, predictions, zero_division=0),
+            "recall": recall_score(y_test, predictions, zero_division=0),
+            "f1": f1_score(y_test, predictions, zero_division=0),
+            "roc_auc": roc_auc_score(y_test, probabilities),
+            "threshold": threshold,
+        },
+    }
+
+
+@st.cache_resource
+def load_model(_df: pd.DataFrame):
+    try:
+        if MODEL_PATH.exists():
+            return joblib.load(MODEL_PATH), "Loaded saved model artifact."
+    except Exception as exc:
+        return train_cloud_model(_df), f"Rebuilt model from CSV because the saved artifact could not be loaded: {exc.__class__.__name__}."
+    return train_cloud_model(_df), "Rebuilt model from CSV because no saved artifact was found."
 
 
 def predict_probability(bundle: dict, row: dict) -> float:
@@ -35,13 +95,10 @@ def predict_probability(bundle: dict, row: dict) -> float:
 st.set_page_config(page_title="Bank Churn Risk Scoring", layout="wide")
 st.title("Bank Customer Churn Risk Scoring")
 
-if not MODEL_PATH.exists():
-    st.error("Model artifact not found. Run `python train_model.py` first.")
-    st.stop()
-
-bundle = load_model()
 df = load_data()
+bundle, model_status = load_model(df)
 threshold = bundle["threshold"]
+st.caption(model_status)
 
 left, right = st.columns([0.34, 0.66])
 
